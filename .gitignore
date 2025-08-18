@@ -1,4 +1,1 @@
-/Dataset
-bertweet_tokenized_dataset.pt
-models/preprocessed_tweets.csv
-models/tokenized_dataset.pt
+.venv/
