@@ -1,0 +1,14 @@
+{
+  "total_rows": 1738364,
+  "by_label": {
+    "negative": 820855,
+    "positive": 852380,
+    "neutral": 65129
+  },
+  "by_source": {
+    "ds1.csv": 1555414,
+    "ds3.csv": 160301,
+    "ds2.csv": 22649
+  },
+  "avg_len": 75.3811698815668
+}
