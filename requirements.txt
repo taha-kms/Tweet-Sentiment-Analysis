@@ -1,0 +1,17 @@
+# Core deep learning + NLP
+torch==2.3.0
+transformers==4.41.2
+datasets==2.19.1
+evaluate==0.4.2
+
+# ML utilities
+scikit-learn==1.5.0
+pandas==2.2.2
+numpy==1.26.4
+
+# Config + helpers
+pyyaml==6.0.1
+tqdm==4.66.4
+
+# Logging / visualization
+tensorboard==2.16.2

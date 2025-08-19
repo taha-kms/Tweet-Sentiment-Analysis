@@ -1,0 +1,55 @@
+# ======================
+# Project Configuration
+# ======================
+
+paths:
+  raw_dir: data/raw
+  proc_dir: data/processed
+  models_dir: models
+  runs_dir: runs
+
+data:
+  text_col: text
+  label_col: label
+  sources:
+    - ds1.csv
+    - ds2.csv
+    - ds3.csv
+  label_map:         # mapping to numeric ids
+    negative: 0
+    neutral: 1
+    positive: 2
+  clean:
+    lower: false
+    replace_urls: true
+    replace_mentions: true
+    keep_emojis: true
+  split:
+    strategy: stratified    # options: stratified, grouped_by_source
+    test_size: 0.15
+    val_size: 0.15
+    seed: 42
+
+model:
+  name: bert-base-uncased   # can swap with roberta-base, bertweet-base, etc.
+  num_labels: 3
+  max_length: 128
+  dropout: 0.1
+  freeze_encoder: false     # set true to only train classification head
+
+train:
+  batch_size: 32
+  eval_batch_size: 64
+  epochs: 3
+  lr: 2e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  gradient_accumulation_steps: 1
+  fp16: true
+  early_stopping_patience: 2
+  metric_for_best_model: f1_macro
+
+logging:
+  tensorboard: true
+  save_every_epochs: 1
+  log_level: info

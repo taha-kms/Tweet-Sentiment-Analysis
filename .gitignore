@@ -26,18 +26,15 @@ outputs/
 *.out
 
 # Data
-Data/raw/
-Data/interim/
-Data/processed/
-!Data/.gitkeep
+data/raw/
+data/processed/
+!data/.gitkeep
 
 # Checkpoints / models
 *.ckpt
 *.pt
 *.bin
 *.h5
-checkpoints/
-runs/
 
 # Config / secrets
 *.env
