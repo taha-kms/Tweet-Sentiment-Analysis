@@ -15,27 +15,42 @@ data:
     - ds1.csv
     - ds2.csv
     - ds3.csv
-  label_map:         # mapping to numeric ids
-    negative: 0
-    neutral: 1
-    positive: 2
+  label_canonical: {negative: 0, neutral: 1, positive: 2}
+
+  # dataset-specific raw label -> canonical mapping
+  value_to_canonical:
+    ds1.csv:        # negative(-1), neutral(0), positive(+1)
+      "-1": 0   # negative
+      "0": 1    # neutral
+      "1": 2    # positive
+    ds2.csv:        # "negative", "neutra", "positive"
+      "negative": 0
+      "neutra": 1     # typo neutral
+      "neutral": 1    # in case some rows spelled correctly
+      "positive": 2
+    ds3.csv:        # negative(0), neutral(2), positive(4)
+      "0": 0    # negative
+      "2": 1    # neutral
+      "4": 2    # positive
+
   clean:
     lower: false
     replace_urls: true
     replace_mentions: true
     keep_emojis: true
+
   split:
-    strategy: stratified    # options: stratified, grouped_by_source
+    strategy: stratified    # or grouped_by_source
     test_size: 0.15
     val_size: 0.15
     seed: 42
 
 model:
-  name: bert-base-uncased   # can swap with roberta-base, bertweet-base, etc.
+  name: bert-base-uncased   # try roberta-base, bertweet-base, etc.
   num_labels: 3
   max_length: 128
   dropout: 0.1
-  freeze_encoder: false     # set true to only train classification head
+  freeze_encoder: false     # true = only train classifier head
 
 train:
   batch_size: 32
