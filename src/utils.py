@@ -11,6 +11,7 @@ import random
 import logging
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
+from transformers import AutoTokenizer
 
 
 # -----------------------------
@@ -243,3 +244,19 @@ def save_json(obj: Dict[str, Any], path: str, indent: int = 2) -> None:
 def read_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+# -----------------------------
+# Tokenizer utilities
+# -----------------------------
+
+
+def get_tokenizer(model_name: str):
+    """
+    Return a Hugging Face tokenizer for `model_name`.
+    Prefers fast tokenizers; falls back gracefully if pad_token is missing.
+    """
+    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    if tok.pad_token is None and hasattr(tok, "eos_token"):
+        tok.pad_token = tok.eos_token
+    return tok

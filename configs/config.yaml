@@ -50,21 +50,22 @@ data:
 model:
   name: bert-base-uncased   # try roberta-base, bertweet-base, etc.
   num_labels: 3
-  max_length: 128
+  max_length: 64
   dropout: 0.1
   freeze_encoder: false     
 
 train:
-  batch_size: 32
-  eval_batch_size: 64
-  epochs: 3
+  batch_size: 64
+  eval_batch_size: 128
+  epochs: 5
   lr: 2e-5
   weight_decay: 0.01
   warmup_ratio: 0.1
   gradient_accumulation_steps: 1
   fp16: true
-  early_stopping_patience: 2
+  early_stopping_patience: 3
   metric_for_best_model: f1_macro
+  use_class_weights: true
 
 logging:
   tensorboard: true
