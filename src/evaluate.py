@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
+from tqdm.auto import tqdm
 
 import numpy as np
 import pandas as pd
@@ -117,7 +118,6 @@ def run_inference(
             "Internal error: expected _idx to be available. Please use eval_step below."
         )
 
-
 @torch.no_grad()
 def eval_step(
     model,
@@ -140,7 +140,7 @@ def eval_step(
     )
 
     logits_list, labels_list, idx_list = [], [], []
-    for batch in loader:
+    for batch in tqdm(loader, desc="Evaluating", leave=False):
         idxs = batch["_idx"].numpy()
         idx_list.append(idxs)
 
@@ -166,8 +166,6 @@ def eval_step(
         "labels": labels,
         "indices": indices,
     }
-
-
 def softmax_np(x: np.ndarray) -> np.ndarray:
     x = x - x.max(axis=1, keepdims=True)
     e = np.exp(x)
