@@ -1,5 +1,7 @@
 from __future__ import annotations
 import os
+import json
+from xml.parsers.expat import model
 import yaml
 import numpy as np
 import pandas as pd
@@ -13,6 +15,7 @@ from sklearn.metrics import accuracy_score, f1_score
 
 from datasets import Dataset as HFDataset
 from transformers import (
+    AutoConfig,
     AutoModelForSequenceClassification,
     AutoTokenizer,
     DataCollatorWithPadding,
@@ -39,6 +42,24 @@ def cfg_get(dct, path, default=None):
 
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
+
+def maybe_get_encoder_module(model):
+    """
+    Try to find the encoder/backbone module across common architectures.
+    Returns the module or None if not found.
+    """
+    for attr in ("base_model", "bert", "roberta", "distilbert", "xlm_roberta", "deberta", "deberta_v2"):
+        if hasattr(model, attr):
+            return getattr(model, attr)
+    return None
+
+def freeze_encoder(model):
+    enc = maybe_get_encoder_module(model)
+    if enc is None:
+        return
+    for p in enc.parameters():
+        p.requires_grad = False
+ 
 
 
 # ---------------------------
@@ -139,13 +160,18 @@ def main():
     cfg = load_config("configs/config.yaml")
     set_seed(int(cfg_get(cfg, "data.split.seed", 42)))
 
-    proc_dir   = cfg_get(cfg, "paths.proc_dir", "data/processed")   # :contentReference[oaicite:3]{index=3}
-    text_col   = cfg_get(cfg, "data.text_col", "text")              # :contentReference[oaicite:4]{index=4}
-    label_col  = cfg_get(cfg, "data.label_col", "label")            # :contentReference[oaicite:5]{index=5}
+    proc_dir   = cfg_get(cfg, "paths.proc_dir", "data/processed")
+    models_dir = cfg_get(cfg, "paths.models_dir", "models")
+    runs_dir   = cfg_get(cfg, "paths.runs_dir", "runs")
+    text_col   = cfg_get(cfg, "data.text_col", "text")      
+    label_col  = cfg_get(cfg, "data.label_col", "label")        
+       
 
-    model_name = cfg_get(cfg, "model.name", "bert-base-uncased")    # :contentReference[oaicite:6]{index=6}
-    max_len    = int(cfg_get(cfg, "model.max_length", 64))          # tuned down for tweets
+    model_name = cfg_get(cfg, "model.name", "bert-base-uncased")   
+    max_len    = int(cfg_get(cfg, "model.max_length", 64))          
+    num_labels   = int(cfg_get(cfg, "data.num_labels", 3))  # :contentReference[oaicite:8]{index=8}
 
+    
     epochs     = int(cfg_get(cfg, "train.epochs", 5))
     lr         = float(cfg_get(cfg, "train.lr", 2e-5))
     weight_decay = float(cfg_get(cfg, "train.weight_decay", 0.01))
@@ -155,7 +181,7 @@ def main():
     fp16         = bool(cfg_get(cfg, "train.fp16", True))
     early_pat    = int(cfg_get(cfg, "train.early_stopping_patience", 3))
     metric_best  = cfg_get(cfg, "train.metric_for_best_model", "f1_macro")  # :contentReference[oaicite:7]{index=7}
-    num_labels   = int(cfg_get(cfg, "data.num_labels", 3))  # :contentReference[oaicite:8]{index=8}
+    
 
     # ---- IO
     ensure_dir("runs")
@@ -183,7 +209,7 @@ def main():
     # ---- Model
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
-        num_labels=model.config.num_labels,
+        num_labels=num_labels,
     )
 
     # ---- Training args
