@@ -46,3 +46,6 @@ secrets.json
 Thumbs.db
 .vscode/
 .idea/
+
+runs/
+!runs/.gitkeep
