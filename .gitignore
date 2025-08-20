@@ -25,20 +25,12 @@ outputs/
 *.log
 *.out
 
-# Data
-data/raw/
-data/processed/
-!data/raw/.gitkeep
-!data/processed/.gitkeep
-!data/.gitkeep
-
-
 # Checkpoints / models
 *.ckpt
 *.pt
 *.bin
 *.h5
-models/
+models/*
 
 # Config / secrets
 *.env
@@ -49,7 +41,5 @@ secrets.json
 .DS_Store
 Thumbs.db
 .vscode/
-.idea/
 
-runs/
-!runs/.gitkeep
+
