@@ -169,8 +169,9 @@ def main():
 
     model_name = cfg_get(cfg, "model.name", "bert-base-uncased")   
     max_len    = int(cfg_get(cfg, "model.max_length", 64))          
-    num_labels   = int(cfg_get(cfg, "data.num_labels", 3))  # :contentReference[oaicite:8]{index=8}
-
+    num_labels   = int(cfg_get(cfg, "data.num_labels", 3))
+    dropout    = float(cfg_get(cfg, "model.dropout", 0.1))
+    freeze_enc = bool(cfg_get(cfg, "model.freeze_encoder", False))
     
     epochs     = int(cfg_get(cfg, "train.epochs", 5))
     lr         = float(cfg_get(cfg, "train.lr", 2e-5))
@@ -181,14 +182,17 @@ def main():
     fp16         = bool(cfg_get(cfg, "train.fp16", True))
     early_pat    = int(cfg_get(cfg, "train.early_stopping_patience", 3))
     metric_best  = cfg_get(cfg, "train.metric_for_best_model", "f1_macro")  # :contentReference[oaicite:7]{index=7}
-    
+    grad_acc     = int(cfg_get(cfg, "train.gradient_accumulation_steps", 1))
+    num_workers  = int(cfg_get(cfg, "train.num_workers", 2))
+
+
 
     # ---- IO
-    ensure_dir("runs")
-    ensure_dir("models")
-    best_dir = os.path.join("models", "best")
+    ensure_dir(runs_dir)
+    ensure_dir(models_dir)
+    best_dir = os.path.join(models_dir, "best")
 
-    # ---- Load parquet produced by your dataset pipeline
+    # ---- Load parquet produced by dataset.py pipeline
     train_df = pd.read_parquet(os.path.join(proc_dir, "train.parquet"))
     val_df   = pd.read_parquet(os.path.join(proc_dir, "val.parquet"))
 
@@ -207,21 +211,30 @@ def main():
     class_weights = compute_class_weights(train_df, label_col)
 
     # ---- Model
-    model = AutoModelForSequenceClassification.from_pretrained(
+    hf_config = AutoConfig.from_pretrained(
         model_name,
         num_labels=num_labels,
+        hidden_dropout_prob=dropout,
+        attention_probs_dropout_prob=dropout,
+        classifier_dropout=dropout,
     )
+
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, config=hf_config)
+    if freeze_enc:
+        freeze_encoder(model)
 
     # ---- Training args
     args = TrainingArguments(
-        output_dir="models/checkpoints",
+        output_dir=os.path.join(models_dir, "checkpoints"),
         overwrite_output_dir=True,
         num_train_epochs=epochs,
         per_device_train_batch_size=train_bs,
         per_device_eval_batch_size=eval_bs,
         learning_rate=lr,
+        max_grad_norm=1.0,
         weight_decay=weight_decay,
         warmup_ratio=warmup_ratio,
+        gradient_accumulation_steps=grad_acc,
         eval_strategy="epoch",
         save_strategy="epoch",
         logging_strategy="steps",
@@ -232,8 +245,8 @@ def main():
         save_total_limit=2,
         fp16=fp16,
         report_to=["tensorboard"],
-        logging_dir="runs",
-        dataloader_num_workers=2,
+        logging_dir=runs_dir,
+        dataloader_num_workers=num_workers,
         remove_unused_columns=False,  # we already control columns
     )
 

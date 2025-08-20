@@ -66,7 +66,8 @@ train:
   early_stopping_patience: 3
   metric_for_best_model: f1_macro
   use_class_weights: true
-
+  num_workers: 4 
+  
 logging:
   tensorboard: true
   save_every_epochs: 1
