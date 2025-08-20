@@ -1,32 +1,59 @@
-# src/evaluate.py
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Evaluate a text classification model on val/test splits.
+
+Features
+- Metrics: accuracy, F1 (macro/micro), per-class P/R/F1, confusion matrix.
+- Per-source metrics (if `source_ds` column exists).
+- Misclassified rows with logits/probs saved to CSV.
+- Optional reliability diagram & ROC-AUC (OvR) plots.
+- Artifacts written to a unique timestamped run directory:
+  runs/<YYYYMMDD-HHMMSS_[optional-name-or-auto]>/
+    - params.json (config + env + args)
+    - config.yaml (exact copy used)
+    - metrics_val.json, metrics_test.json, metrics_overview.csv
+    - misclassified_val.csv, misclassified_test.csv
+    - hard_cases.csv (top-100 by cross-entropy)
+    - confusion_matrix.png (test)
+    - *_reliability.png / *_roc_auc.png (if --include_plots)
+"""
+
 import argparse
+import datetime as dt
+import hashlib
 import json
 import os
+import platform
+import shutil
+import sys
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
-from tqdm.auto import tqdm
+from typing import Dict, List, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 import yaml
 from sklearn.metrics import (
     accuracy_score,
-    f1_score,
-    precision_recall_fscore_support,
     classification_report,
     confusion_matrix,
+    f1_score,
+    precision_recall_fscore_support,
     roc_auc_score,
 )
-import matplotlib.pyplot as plt
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from torch.utils.data import DataLoader, Dataset
-import torch.nn.functional as F
+from tqdm.auto import tqdm
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 
 # -------------------------------
-# IO / Config
+# I/O & run management
 # -------------------------------
+
 def load_config(path: str) -> dict:
     with open(path, "r") as f:
         return yaml.safe_load(f)
@@ -36,18 +63,55 @@ def ensure_dir(p: str):
     Path(p).mkdir(parents=True, exist_ok=True)
 
 
+def timestamped_run_name(cfg: dict, base_name: str | None, args: argparse.Namespace) -> str:
+    """Always prefix with timestamp; if base_name provided, append it."""
+    ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    if base_name:
+        return f"{ts}_{base_name}"
+    m = cfg.get("model", {})
+    t = cfg.get("train", {})
+    data_seed = cfg.get("data", {}).get("split", {}).get("seed", "?")
+    auto = f"model={m.get('name','?')}_lr={t.get('lr','?')}_bs={t.get('batch_size','?')}_len={m.get('max_length','?')}_seed={data_seed}"
+    return f"{ts}_{auto}"
+
+
+def create_run_dir(out_root: str, run_name: str) -> str:
+    """Create run directory; if it somehow exists, add _vN (extremely unlikely with timestamps)."""
+    base = Path(out_root) / run_name
+    out = base
+    v = 1
+    while out.exists():
+        v += 1
+        out = Path(f"{base}_v{v}")
+    out.mkdir(parents=True, exist_ok=False)
+    return str(out)
+
+
+def dump_params(out_dir: str, cfg: dict, args: argparse.Namespace, notes: str):
+    meta = {
+        "timestamp": dt.datetime.now().isoformat(),
+        "notes": notes,
+        "args": vars(args),
+        "config_hash": hashlib.md5(json.dumps(cfg, sort_keys=True).encode()).hexdigest(),
+        "python": sys.version,
+        "platform": platform.platform(),
+        "torch": torch.__version__,
+        "transformers": __import__("transformers").__version__,
+        "sklearn": __import__("sklearn").__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+    }
+    with open(os.path.join(out_dir, "params.json"), "w") as f:
+        json.dump({"config": cfg, "meta": meta}, f, indent=2)
+
+
 # -------------------------------
-# Dataset
+# Dataset & batching
 # -------------------------------
+
 class SimpleTextDataset(Dataset):
-    def __init__(
-        self,
-        df: pd.DataFrame,
-        tokenizer,
-        max_length: int,
-        text_col: str = "text",
-        label_col: str = "label",
-    ):
+    def __init__(self, df: pd.DataFrame, tokenizer, max_length: int,
+                 text_col: str = "text", label_col: str = "label"):
         self.df = df.reset_index(drop=True)
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -59,9 +123,8 @@ class SimpleTextDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        text = str(row[self.text_col])
         enc = self.tokenizer(
-            text,
+            str(row[self.text_col]),
             truncation=True,
             padding="max_length",
             max_length=self.max_length,
@@ -70,16 +133,16 @@ class SimpleTextDataset(Dataset):
         item = {k: v.squeeze(0) for k, v in enc.items()}
         if self.label_col in row and pd.notna(row[self.label_col]):
             item["labels"] = torch.tensor(int(row[self.label_col]), dtype=torch.long)
-        item["_idx"] = torch.tensor(idx, dtype=torch.long)  # for back-reference
+        item["_idx"] = torch.tensor(idx, dtype=torch.long)  # track original row index
         return item
 
 
-def make_loader(df, tokenizer, max_length, batch_size, num_workers=2, shuffle=False):
+def make_loader(df, tokenizer, max_length, batch_size, num_workers=4):
     ds = SimpleTextDataset(df, tokenizer, max_length)
     return DataLoader(
         ds,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=False,
@@ -87,36 +150,21 @@ def make_loader(df, tokenizer, max_length, batch_size, num_workers=2, shuffle=Fa
 
 
 # -------------------------------
-# Evaluation core
+# Core evaluation helpers
 # -------------------------------
-@torch.no_grad()
-def run_inference(
-    model,
-    loader: DataLoader,
-    device: torch.device,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    model.eval()
-    all_logits, all_labels, all_indices = [], [], []
-    for batch in loader:
-        batch = {k: v.to(device) for k, v in batch.items() if k not in ["_idx"]}
-        idxs = batch.pop("labels", None)
-        # We kept true labels; but we also want to track dataset row indices
-        # -> bring them separately:
-        # (labels are already popped; we still need the true labels)
-        true_labels = idxs
-        # recover indices from batch (added as _idx in dataset)
-        # we need to fetch from the original un-moved batch
-        # Workaround: DataLoader collates "_idx"; pull it from loader again:
-        # Better: re-add "_idx" to the batch dict before moving to device
-        # So instead, we pass indices via a different handle:
-        # Just re-run tokenizer? No. Simpler: loader dataset stores order; we rely on enumeration
-        # To be robust, we’ll attach indices to attention_mask’s shape—too hacky.
-        # Clean way: put _idx back:
-        # (We still have access in outer scope? No.)
-        # Quick fix: change dataset/getitem to put _idx and keep it out of 'batch' moved to device.
-        raise NotImplementedError(
-            "Internal error: expected _idx to be available. Please use eval_step below."
-        )
+
+def softmax_np(x: np.ndarray) -> np.ndarray:
+    x = x - x.max(axis=1, keepdims=True)
+    e = np.exp(x)
+    return e / (e.sum(axis=1, keepdims=True) + 1e-12)
+
+
+def cross_entropy_rowwise(logits: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    """Cross-entropy per example from raw logits and integer labels."""
+    x = logits - logits.max(axis=1, keepdims=True)
+    log_probs = x - np.log(np.exp(x).sum(axis=1, keepdims=True) + 1e-12)
+    return -log_probs[np.arange(len(labels)), labels]
+
 
 @torch.no_grad()
 def eval_step(
@@ -129,22 +177,13 @@ def eval_step(
     num_workers: int,
 ) -> Dict[str, np.ndarray]:
     model.eval()
-    ds = SimpleTextDataset(df, tokenizer, max_length)
-    loader = DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=False,
-    )
+    loader = make_loader(df, tokenizer, max_length, batch_size, num_workers)
 
     logits_list, labels_list, idx_list = [], [], []
     for batch in tqdm(loader, desc="Evaluating", leave=False):
         idxs = batch["_idx"].numpy()
         idx_list.append(idxs)
 
-        # move inputs that belong on device
         inputs = {k: v.to(device) for k, v in batch.items() if k not in ["labels", "_idx"]}
         outputs = model(**inputs)
         logits = outputs.logits.detach().cpu().numpy()
@@ -166,17 +205,6 @@ def eval_step(
         "labels": labels,
         "indices": indices,
     }
-def softmax_np(x: np.ndarray) -> np.ndarray:
-    x = x - x.max(axis=1, keepdims=True)
-    e = np.exp(x)
-    return e / e.sum(axis=1, keepdims=True)
-
-
-def cross_entropy_rowwise(logits: np.ndarray, labels: np.ndarray) -> np.ndarray:
-    # logits -> probabilities via softmax for numerical stability
-    log_probs = logits - logits.max(axis=1, keepdims=True)
-    log_probs = log_probs - np.log(np.exp(log_probs).sum(axis=1, keepdims=True) + 1e-12)
-    return -log_probs[np.arange(len(labels)), labels]
 
 
 def compute_basic_metrics(y_true: np.ndarray, y_pred: np.ndarray, labels: List[int]) -> Dict:
@@ -191,11 +219,16 @@ def compute_basic_metrics(y_true: np.ndarray, y_pred: np.ndarray, labels: List[i
     )
     cm = confusion_matrix(y_true, y_pred, labels=labels)
     return {
-        "accuracy": acc,
-        "f1_macro": f1_macro,
-        "f1_micro": f1_micro,
+        "accuracy": float(acc),
+        "f1_macro": float(f1_macro),
+        "f1_micro": float(f1_micro),
         "per_class": {
-            str(lbl): {"precision": float(prec[i]), "recall": float(rec[i]), "f1": float(f1[i]), "support": int(support[i])}
+            str(lbl): {
+                "precision": float(prec[i]),
+                "recall": float(rec[i]),
+                "f1": float(f1[i]),
+                "support": int(support[i]),
+            }
             for i, lbl in enumerate(labels)
         },
         "classification_report": cls_report,
@@ -227,7 +260,6 @@ def plot_confusion_matrix(cm: np.ndarray, labels: List[str], out_path: str, norm
 
 
 def plot_reliability(probs: np.ndarray, y_true: np.ndarray, out_path: str, n_bins: int = 15):
-    # confidence = max class prob
     conf = probs.max(axis=1)
     pred = probs.argmax(axis=1)
     correct = (pred == y_true).astype(float)
@@ -242,8 +274,8 @@ def plot_reliability(probs: np.ndarray, y_true: np.ndarray, out_path: str, n_bin
             confs.append((bins[b] + bins[b + 1]) / 2.0)
             cnts.append(0)
         else:
-            accs.append(correct[m].mean())
-            confs.append(conf[m].mean())
+            accs.append(float(correct[m].mean()))
+            confs.append(float(conf[m].mean()))
             cnts.append(int(m.sum()))
 
     plt.figure(figsize=(6, 6))
@@ -263,11 +295,10 @@ def plot_reliability(probs: np.ndarray, y_true: np.ndarray, out_path: str, n_bin
 
 
 def plot_ovr_roc(probs: np.ndarray, y_true: np.ndarray, labels: List[int], out_path: str):
-    # One-vs-rest ROC-AUC (macro)
     y_true_bin = np.zeros((len(y_true), len(labels)), dtype=int)
     for i, lbl in enumerate(labels):
         y_true_bin[:, i] = (y_true == lbl).astype(int)
-    # AUC per class (if both positives and negatives exist)
+
     aucs = []
     for i, lbl in enumerate(labels):
         if y_true_bin[:, i].sum() == 0 or y_true_bin[:, i].sum() == len(y_true_bin):
@@ -289,8 +320,9 @@ def plot_ovr_roc(probs: np.ndarray, y_true: np.ndarray, labels: List[int], out_p
 
 
 # -------------------------------
-# End-to-end evaluate
+# Split-level evaluation
 # -------------------------------
+
 def evaluate_split(
     name: str,
     df: pd.DataFrame,
@@ -304,24 +336,28 @@ def evaluate_split(
     label_names: Dict[int, str],
     out_dir: str,
     include_plots: bool,
-) -> Dict:
+) -> Tuple[Dict, pd.DataFrame]:
     res = eval_step(model, df, tokenizer, device, max_length, batch_size, num_workers)
     logits, probs, preds, labels = res["logits"], res["probs"], res["preds"], res["labels"]
 
     metrics = compute_basic_metrics(labels, preds, label_list)
-    # save confusion matrix for test split (per DoD)
+
+    # Save confusion matrix for test split as per DoD
     if name == "test":
         cm_path = os.path.join(out_dir, "confusion_matrix.png")
-        plot_confusion_matrix(np.array(metrics["confusion_matrix"]), [label_names[i] for i in label_list], cm_path, normalize=False)
+        plot_confusion_matrix(
+            np.array(metrics["confusion_matrix"]),
+            [label_names[i] for i in label_list],
+            cm_path,
+            normalize=False,
+        )
 
-    # optional plots
+    # Optional plots
     if include_plots:
-        rel_path = os.path.join(out_dir, f"{name}_reliability.png")
-        plot_reliability(probs, labels, rel_path)
-        roc_path = os.path.join(out_dir, f"{name}_roc_auc.png")
-        plot_ovr_roc(probs, labels, label_list, roc_path)
+        plot_reliability(probs, labels, os.path.join(out_dir, f"{name}_reliability.png"))
+        plot_ovr_roc(probs, labels, label_list, os.path.join(out_dir, f"{name}_roc_auc.png"))
 
-    # misclassified with logits
+    # Misclassified with logits/probs
     ce = cross_entropy_rowwise(logits, labels)
     mis_mask = preds != labels
     mis_df = df.iloc[res["indices"][mis_mask]].copy()
@@ -333,7 +369,7 @@ def evaluate_split(
     mis_csv = os.path.join(out_dir, f"misclassified_{name}.csv")
     mis_df.to_csv(mis_csv, index=False)
 
-    # per-source metrics & cross-domain
+    # Per-source metrics
     per_source = {}
     if "source_ds" in df.columns:
         for s, g in df.groupby("source_ds"):
@@ -341,14 +377,21 @@ def evaluate_split(
             m = compute_basic_metrics(rr["labels"], rr["preds"], label_list)
             per_source[str(s)] = m
 
-    return {
-        "split": name,
-        "overall": metrics,
-        "per_source": per_source,
-        "misclassified_csv": os.path.abspath(mis_csv),
-        "sizes": {"total": int(len(df))},
-    }, mis_df
+    return (
+        {
+            "split": name,
+            "overall": metrics,
+            "per_source": per_source,
+            "misclassified_csv": os.path.abspath(mis_csv),
+            "sizes": {"total": int(len(df))},
+        },
+        mis_df,
+    )
 
+
+# -------------------------------
+# Main
+# -------------------------------
 
 def main():
     parser = argparse.ArgumentParser()
@@ -359,39 +402,57 @@ def main():
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--out_dir", default="runs")
-    parser.add_argument("--include_plots", action="store_true")  # reliability & ROC
+    parser.add_argument("--include_plots", action="store_true")
+    # run management
+    parser.add_argument("--out_root", default="runs")
+    parser.add_argument("--run_name", default=None, help="Optional human-readable suffix for the run folder")
+    parser.add_argument("--notes", default="", help="Free-form notes to store in params.json")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    ensure_dir(args.out_dir)
 
-    # labels & names
+    # Build unique run dir
+    run_name = timestamped_run_name(cfg, args.run_name, args)
+    out_dir = create_run_dir(args.out_root, run_name)
+    ensure_dir(out_dir)
+
+    # Save provenance
+    dump_params(out_dir, cfg, args, args.notes)
+    # store an exact copy of the config used
+    try:
+        shutil.copy2(args.config, os.path.join(out_dir, "config.yaml"))
+    except Exception:
+        pass
+
+    # Labels & names
     num_labels = int(cfg.get("model", {}).get("num_labels", 3))
-    label_canonical = cfg.get("data", {}).get("label_canonical", {"negative": 0, "neutral": 1, "positive": 2})
-    # reverse map for nicer axis labels if available
+    label_canonical = cfg.get("data", {}).get(
+        "label_canonical", {"negative": 0, "neutral": 1, "positive": 2}
+    )
     inv_map = {v: k for k, v in label_canonical.items()}
     label_list = list(range(num_labels))
     label_names = {i: inv_map.get(i, str(i)) for i in label_list}
 
-    # load model & tokenizer
+    # Load model & tokenizer
     model_name = cfg.get("model", {}).get("name", args.checkpoint)
     max_len = int(cfg.get("model", {}).get("max_length", 64))
-    tokenizer = AutoTokenizer.from_pretrained(args.checkpoint if Path(args.checkpoint).exists() else model_name, use_fast=True)
+    tok_src = args.checkpoint if Path(args.checkpoint).exists() else model_name
+    tokenizer = AutoTokenizer.from_pretrained(tok_src, use_fast=True)
     model = AutoModelForSequenceClassification.from_pretrained(
-        args.checkpoint if Path(args.checkpoint).exists() else model_name,
-        num_labels=num_labels,
+        tok_src, num_labels=num_labels
     )
     device = torch.device(args.device)
     model.to(device)
 
-    # load data
+    # Load splits
     val_df = pd.read_parquet(args.val_path)
     test_df = pd.read_parquet(args.test_path)
 
-    # run evaluations
-    results = {}
+    print(f"[run] {run_name}")
+    print(f"[dir] {out_dir}")
+    print(f"[val] {len(val_df):,} rows  | [test] {len(test_df):,} rows")
 
+    # Evaluate
     val_metrics, val_mis = evaluate_split(
         "val",
         val_df,
@@ -403,11 +464,9 @@ def main():
         args.num_workers,
         label_list,
         label_names,
-        args.out_dir,
+        out_dir,
         args.include_plots,
     )
-    results["val"] = val_metrics
-
     test_metrics, test_mis = evaluate_split(
         "test",
         test_df,
@@ -419,30 +478,28 @@ def main():
         args.num_workers,
         label_list,
         label_names,
-        args.out_dir,
+        out_dir,
         args.include_plots,
     )
-    results["test"] = test_metrics
 
     # Save required artifacts
-    # 1) JSON
-    metrics_test_json = os.path.join(args.out_dir, "metrics_test.json")
-    with open(metrics_test_json, "w") as f:
-        json.dump(results["test"], f, indent=2)
-    # also drop val metrics alongside
-    with open(os.path.join(args.out_dir, "metrics_val.json"), "w") as f:
-        json.dump(results["val"], f, indent=2)
+    with open(os.path.join(out_dir, "metrics_val.json"), "w") as f:
+        json.dump(val_metrics, f, indent=2)
+    with open(os.path.join(out_dir, "metrics_test.json"), "w") as f:
+        json.dump(test_metrics, f, indent=2)
 
-    # 2) Hardest 100 misclassified (by CE) across val+test
-    both = pd.concat([val_mis.assign(split="val"), test_mis.assign(split="test")], axis=0, ignore_index=True)
+    both = pd.concat(
+        [val_mis.assign(split="val"), test_mis.assign(split="test")],
+        axis=0,
+        ignore_index=True,
+    )
     hardest = both.sort_values("loss", ascending=False).head(100)
-    hard_csv = os.path.join(args.out_dir, "hard_cases.csv")
-    hardest.to_csv(hard_csv, index=False)
+    hardest.to_csv(os.path.join(out_dir, "hard_cases.csv"), index=False)
 
-    # 3) Also export a compact CSV of overall metrics for quick scanning
+    # Compact overview CSV
     rows = []
-    for split in ["val", "test"]:
-        ov = results[split]["overall"]
+    for split, metr in [("val", val_metrics), ("test", test_metrics)]:
+        ov = metr["overall"]
         rows.append(
             {
                 "split": split,
@@ -451,12 +508,12 @@ def main():
                 "f1_micro": ov["f1_micro"],
             }
         )
-    pd.DataFrame(rows).to_csv(os.path.join(args.out_dir, "metrics_overview.csv"), index=False)
+    pd.DataFrame(rows).to_csv(os.path.join(out_dir, "metrics_overview.csv"), index=False)
 
-    print(f"[OK] Wrote: {metrics_test_json}")
-    print(f"[OK] Wrote: {os.path.join(args.out_dir, 'confusion_matrix.png')} (test)")
-    print(f"[OK] Wrote: {hard_csv}")
-    print(f"[OK] Misclassified CSVs: {results['val']['misclassified_csv']}, {results['test']['misclassified_csv']}")
+    print(f"[OK] wrote -> {os.path.join(out_dir, 'metrics_test.json')}")
+    print(f"[OK] wrote -> {os.path.join(out_dir, 'confusion_matrix.png')} (test)")
+    print(f"[OK] wrote -> {os.path.join(out_dir, 'hard_cases.csv')}")
+    print(f"[OK] misclassified -> {val_metrics['misclassified_csv']}, {test_metrics['misclassified_csv']}")
 
 
 if __name__ == "__main__":
