@@ -120,31 +120,144 @@ See [config file](configs/config.yaml) for:
 
 ---
 
-## 🗂️ Git Hygiene
+# ⚙️ CLI & Arguments
 
-Keep heavy outputs out of Git. `.gitignore` should include:
+This project exposes three main entrypoints:
 
-* `data/raw/`, `data/processed/`
-* `models/`, `runs/`
-* `*.log`, `.ipynb_checkpoints/`
+* **Dataset builder:** `python3 -m src.dataset`
+* **Training:** `python3 -m src.train`
+* **Evaluation:** `python3 -m src.evaluate`
+
+Below are the important flags and how to use them.
 
 ---
 
-## ✅ Workflow Summary
+## 📦 `src.dataset` — build processed splits
 
 ```bash
-# 1. Prepare dataset
-python3 -m src.dataset --config configs/config.yaml
-
-# 2. Check dataloaders
-python3 -m src.dataloaders
-
-# 3. Train model
-python3 -m src.train --config configs/config.yaml
-
-# 4. Evaluate best checkpoint
-python3 -m src.evaluate --last --include_plots
+python3 -m src.dataset --config configs/config.yaml [--no-split]
 ```
 
+**Args**
+
+* `--config` Path to YAML config (paths, cleaning, label mapping, split sizes).&#x20;
+* `--no-split` Only create `merged.parquet` (skip train/val/test).&#x20;
+
+**Outputs**
+
+* `data/processed/merged.parquet` + `train.parquet`, `val.parquet`, `test.parquet`.&#x20;
+* A small `runs/data_report.json` summary.&#x20;
+
 ---
+
+## 🏋️ `src.train` — train a transformer model
+
+```bash
+python3 -m src.train --config configs/config.yaml \
+                     [--models "bert-base-uncased,roberta-base"] \
+                     [--models_root models] \
+                     [--train_path data/processed/train.parquet] \
+                     [--val_path data/processed/val.parquet] \
+                     [--device cuda|cpu]
+```
+
+**Args**
+
+* `--config` Config to load hyperparams, paths, etc.&#x20;
+* `--models` Comma-separated HF model names; if omitted uses `model.name` from the config.&#x20;
+* `--models_root` Parent folder where runs are saved (defaults to `paths.models_dir`).&#x20;
+* `--train_path`, `--val_path` Parquet splits to use.&#x20;
+* `--device` `cuda` (default if available) or `cpu`.&#x20;
+
+**Run layout**
+
+```
+models/<MODEL>_<YYYYMMDD-HHMM>/
+  best/         # best epoch by metric (default: f1_macro)
+  last/         # last epoch
+  tokenizer/
+  train_log.csv # per-epoch metrics
+  params.json   # (config + meta) recorded for provenance
+```
+
+
+
+---
+
+## ✅ `src.evaluate` — evaluate checkpoints & keep a global index
+
+```bash
+# Evaluate newest trained model (auto-detected), prefer BEST checkpoint
+python3 -m src.evaluate --last [--include_plots] [--run_tag some-note]
+
+# Re-evaluate a specific run folder (auto-picks best/ inside it if present)
+python3 -m src.evaluate --checkpoint models/bert-base-uncased_20250820-1538 [--include_plots]
+
+# Evaluate an explicit subfolder (force BEST or LAST)
+python3 -m src.evaluate --checkpoint models/bert-base-uncased_20250820-1538/best
+python3 -m src.evaluate --checkpoint models/bert-base-uncased_20250820-1538/last
+```
+
+**Key args**
+
+* `--last`
+  Picks the **most recent** run directory under `<models_root>` and evaluates it (prefers `best/`, falls back to `last/`). Great for “just trained something; now evaluate it.”&#x20;
+* `--checkpoint PATH`
+  Re-evaluate a **specific model**. `PATH` can be the run folder (script will prefer `best/`), or a direct path to `best/` or `last/`. Use this when you want to compare runs or regenerate plots.&#x20;
+* `--run_tag TAG` (**tags**)
+  Adds a short note to the eval folder name so you can tell runs apart, e.g. `eval/20250820-1802_paperA`.&#x20;
+* `--include_plots`
+  Saves reliability and ROC-AUC plots, plus confusion matrix image.&#x20;
+* `--batch_size`, `--num_workers`, `--device`, `--val_path`, `--test_path`
+  Control evaluation speed, device and which splits to score.&#x20;
+
+**Eval outputs (per run)**
+
+```
+models/<RUN>/eval/<YYYYMMDD-HHMM[_TAG]>/
+  metrics_val.json
+  metrics_test.json
+  metrics_overview.csv    # val/test accuracy + F1 macro/micro table
+  misclassified_val.csv
+  misclassified_test.csv
+  hard_cases.csv          # top-100 highest-loss examples across val+test
+  confusion_matrix.png    # + optional reliability / ROC-AUC plots
+```
+
+
+
+---
+
+## 📒 Global leaderboard: `overall_evaluations.csv`
+
+After **each** evaluation, one row is appended to:
+`<models_root>/overall_evaluations.csv`.&#x20;
+
+**What’s recorded per row**
+
+* `model_run` — the run folder name, e.g. `bert-base-uncased_20250820-1538`.
+* `eval_dir` — the exact eval folder path.
+* `val_accuracy`, `val_f1_macro`, `val_f1_micro`, `test_accuracy`, `test_f1_macro`, `test_f1_micro`.&#x20;
+* **All parameters flattened** from `params.json` (both `config.*` and `meta.*`) so each becomes its own column, enabling easy slicing/filtering in pandas/Sheets.&#x20;
+
+This lets you build a simple **leaderboard** across runs (filter by model name, max length, seed, etc.) without opening each eval folder.
+
+> Tip: If you later decide to record *every fine-grained metric* (e.g., per-class precision/recall, per-source scores) into the global file, you can extend the script by flattening the full `val_metrics`/`test_metrics` dict before appending (your code already has a `flatten()` helper).&#x20;
+
+---
+
+## 🧠 Common scenarios
+
+* **“Give me the newest model’s scores”**
+  `python3 -m src.evaluate --last`  → picks latest run, evaluates `best/`.&#x20;
+
+* **“Re-evaluate this exact model and keep results separate with a tag”**
+  `python3 -m src.evaluate --checkpoint models/<RUN> --run_tag recheck --include_plots`
+  Creates `models/<RUN>/eval/<STAMP>_recheck/…`.&#x20;
+
+* **“Compare multiple trainings in a sheet”**
+  Open `<models_root>/overall_evaluations.csv` — each eval is one row with metrics + config/meta columns.&#x20;
+
+---
+
 
