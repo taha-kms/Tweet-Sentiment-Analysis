@@ -155,6 +155,7 @@ def main():
     fp16         = bool(cfg_get(cfg, "train.fp16", True))
     early_pat    = int(cfg_get(cfg, "train.early_stopping_patience", 3))
     metric_best  = cfg_get(cfg, "train.metric_for_best_model", "f1_macro")  # :contentReference[oaicite:7]{index=7}
+    num_labels   = int(cfg_get(cfg, "data.num_labels", 3))  # :contentReference[oaicite:8]{index=8}
 
     # ---- IO
     ensure_dir("runs")
@@ -182,7 +183,7 @@ def main():
     # ---- Model
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
-        num_labels=3,
+        num_labels=model.config.num_labels,
     )
 
     # ---- Training args
