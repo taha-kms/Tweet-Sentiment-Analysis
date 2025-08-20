@@ -38,6 +38,7 @@ data/processed/
 *.pt
 *.bin
 *.h5
+models/
 
 # Config / secrets
 *.env
